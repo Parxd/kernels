@@ -1,7 +1,8 @@
-#include "cute/arch/copy.hpp"
 #include "cute/arch/copy_sm80.hpp"
+#include "cute/atom/mma_atom.hpp"
 #include "cute/layout.hpp"
 #include "cute/tensor_impl.hpp"
+#include "cute/underscore.hpp"
 #include <cute/tensor.hpp>
 
 namespace ampere_sgemm_128x32_3stage {
@@ -68,23 +69,21 @@ __global__ void ampere_sgemm_128x32_3stage(
 
 #if 0
     if(thread0()) {
-        print(tCsA); print("\n");
-        print(tCsB); print("\n");
-        print(tCrA); print("\n");
-        print(tCrB); print("\n");
+        print(tiled_mma.thrfrg_A(sA)); print("\n");
+        print(tiled_mma.thrfrg_B(sB)); print("\n");
     }
 #endif
 
-#if 0
-    auto tCrA = make_fragment_like(composition(tCsA(_,_,_,0), make_shape(_,_,_2{})));
-    auto tCrB = make_fragment_like(composition(tCsB(_,_,_,0), make_shape(_,_,_2{})));
+#if 1
+    auto tCrA = make_fragment_like(composition(tCsA(_,_,_,0), make_shape(_,_,blockPipes{})));
+    auto tCrB = make_fragment_like(composition(tCsB(_,_,_,0), make_shape(_,_,blockPipes{})));
 
     int block_pipe = 0;
     cp_async_wait<smem_pipes - 2>();
     __syncthreads();
-    // prefetch r_block = 0
+    // prefetch rmem_block = 0
     copy(tCsA(_,_,0,0), tCrA(_,_,block_pipe));  // (M, K, pipe)
-    copy(tCsB(_,_,0,0), tCrB(_,_,block_pipe));
+    copy(tCsB(_,_,0,0), tCrB(_,_,block_pipe));  // (N, K, pipe)
 
     uint pipe_read = 0;
     uint pipe_write = smem_pipes - 1;
@@ -97,11 +96,10 @@ __global__ void ampere_sgemm_128x32_3stage(
 
         CUTE_UNROLL
         for (uint block = 0; block < rmem_blocks - 1; ++block) {
+            copy(tCsA(_,_,block+1,pipe_read), tCrA(_,_,block_pipe^1));  // TODO: call before gemm to interleave?
             gemm(tiled_mma, tCrA(_,_,block_pipe), tCrB(_,_,block_pipe), tCrC);
+            copy(tCsB(_,_,block+1,pipe_read), tCrB(_,_,block_pipe^1));
             block_pipe ^= 1;
-            
-            copy(tCsA(_,_,block+1,pipe_read), tCrA(_,_,block_pipe));  // call this before the gemm to interleave?
-            copy(tCsB(_,_,block+1,pipe_read), tCrB(_,_,block_pipe));
         }
         gemm(tiled_mma, tCrA(_,_,block_pipe), tCrB(_,_,block_pipe), tCrC);
         block_pipe ^= 1;
@@ -125,9 +123,9 @@ __global__ void ampere_sgemm_128x32_3stage(
 #endif
 
 /*
-Optimization 1: Vectorized 64-bit loads for B matrix in K-axis 
+Vectorized 64-bit loads for B matrix in K-axis 
 */
-#if 1
+#if 0
     auto tCrA = make_tensor<float>(
         make_layout(
             make_shape(_1{}, size<1>(tCsA), pipeSize{}, blockPipes{}),
@@ -148,9 +146,7 @@ Optimization 1: Vectorized 64-bit loads for B matrix in K-axis
     int block_pipe = 0;
     cp_async_wait<smem_pipes - 2>();
     __syncthreads();
-    // prefetch r_block = 0
-    // copy(tCsA(_,_,0,0), tCrA(_,_,block_pipe));  // (M, K, pipe)
-    // copy(tCsB(_,_,0,0), tCrB(_,_,block_pipe));  // (N, K, pipe)
+    // prefetch rmem_block = 0
     copy(            tCsA_block(_,_,make_coord(_,0),0), tCrA(_,_,_,block_pipe));
     copy(s2r_copy_B, tCsB_block(_,_,make_coord(_,0),0), tCrB(_,_,_,block_pipe));
 
@@ -165,11 +161,10 @@ Optimization 1: Vectorized 64-bit loads for B matrix in K-axis
 
         CUTE_UNROLL
         for (uint block = 0; block < (rmem_blocks / pipeSize{}) - 1; ++block) {
+            copy(tCsA_block(_,_,make_coord(_,block+1),pipe_read), tCrA(_,_,_,block_pipe^1));
             gemm(tiled_mma, tCrA(_,_,_,block_pipe), tCrB(_,_,_,block_pipe), tCrC);
+            copy(tCsB_block(_,_,make_coord(_,block+1),pipe_read), tCrB(_,_,_,block_pipe^1));
             block_pipe ^= 1;
-            
-            copy(tCsA_block(_,_,make_coord(_,block+1),pipe_read), tCrA(_,_,_,block_pipe));  // call this before the gemm to interleave?
-            copy(tCsB_block(_,_,make_coord(_,block+1),pipe_read), tCrB(_,_,_,block_pipe));
         }
         gemm(tiled_mma, tCrA(_,_,_,block_pipe), tCrB(_,_,_,block_pipe), tCrC);
         block_pipe ^= 1;
@@ -225,17 +220,17 @@ void nn(int m, int n, int k, float alpha,
         make_layout(make_shape(Int<32>{}, Int<8>{}), LayoutRight{}),
         make_layout(make_shape(Int<1>{}, Int<4>{}), LayoutRight{})
     );
+
+#if 1
     auto mma = make_tiled_mma(
         MMA_Atom<UniversalFMA<float>>{},
-        make_layout(make_shape(Int<16>{}, Int<16>{})),
+        Layout<Shape<_16,_16>>{},
         Tile<
             Layout<Shape<_16,_4,_2>, Stride<_4,_1,_64>>,
-            // _128,
             _128,
             _32
         >{}
     );
-
     auto kernel = ampere_sgemm_128x32_3stage<decltype(stride_A), decltype(stride_B), decltype(stride_C),
                                              decltype(sA_layout), decltype(sB_layout), decltype(cta_shape),
                                              decltype(copy_A), decltype(copy_B), decltype(mma)>;
@@ -247,6 +242,37 @@ void nn(int m, int n, int k, float alpha,
     kernel<<<grid_dim, block_dim, smem_size, nullptr>>>(
         m, n, k, alpha, beta, A, stride_A, B, stride_B, C, stride_C, cta_shape, sA_layout, sB_layout, copy_A, copy_B, mma
     );
+#endif
+
+// "warp"-tiled MMA
+#if 0
+    // auto sB_layout_swizzled = composition(Swizzle<3,0,8>{}, sB_layout);  // fails w/ 128-bit loads
+    auto sB_layout_swizzled = composition(Swizzle<3,2,6>{}, sB_layout);
+    auto thr_layout = make_layout(
+        make_layout(Shape<_4, _4>{}, Stride<_1, _32>{}),  // M: (LaneM, WarpM)
+        make_layout(Shape<_8, _2>{}, Stride<_4, _128>{})  // N: (LaneN, WarpN)
+    );
+    auto mma = make_tiled_mma(
+        MMA_Atom<UniversalFMA<float>>{}, 
+        thr_layout,
+        Tile<
+            Layout<Shape<_16,_8>, Stride<_8,_1>>,
+            Layout<Shape<_16,_8>, Stride<_8,_1>>,
+            Underscore
+        >{}
+    );
+    auto kernel = ampere_sgemm_128x32_3stage<decltype(stride_A), decltype(stride_B), decltype(stride_C),
+                                             decltype(sA_layout), decltype(sB_layout_swizzled), decltype(cta_shape),
+                                             decltype(copy_A), decltype(copy_B), decltype(mma)>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+
+    dim3 block_dim(size(mma));
+    dim3 grid_dim(size(ceil_div(m, select<0>(cta_shape))), size(ceil_div(n, select<1>(cta_shape))));
+    kernel<<<grid_dim, block_dim, smem_size, nullptr>>>(
+        m, n, k, alpha, beta, A, stride_A, B, stride_B, C, stride_C, cta_shape, sA_layout, sB_layout_swizzled, copy_A, copy_B, mma
+    );
+#endif
 }
 
 }  // namespace ampere_sgemm_128x32_3stage
@@ -260,13 +286,8 @@ void launch_ampere_sgemm_128x32_3stage(
     if (transA == 'N' && transB == 'N') {
         ampere_sgemm_128x32_3stage::nn(m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC);
     }
-    using namespace cute;
-    // auto lt = make_layout(make_shape(16, 4, 2), make_stride(4, 1, 64));
-    // for (int i = 0; i < 128; ++i) {
-    //     printf("%d: %d\n", i, lt(i));
-    // }
-
-    // float* ptr;
-    // auto tensor = make_tensor(ptr, make_layout(make_shape(1, make_shape(4, 2), 32, 3), make_stride(0, 512, 1, 4096)));
-    // print(logical_divide(tensor, make_shape(_,_,2,_))); print("\n");
+    // using namespace cute;
+    // auto lt = make_layout(make_shape(_128{}, _32{}), LayoutRight{});
+    // auto swizzled = composition(Swizzle<3,2,6>{}, lt);
+    // print_latex(swizzled); print("\n");
 }
