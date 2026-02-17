@@ -119,7 +119,14 @@ __global__ void ampere_sgemm_128x32_3stage(
         }
         ++gmem_tile_idx;
     }
-    axpby(alpha, tCrC, beta, tCgC);
+    // axpby(alpha, tCrC, beta, tCgC);  // TODO: uncoalesced stg
+    auto tCgC_fragment = make_fragment_like(tCrC(_,_,0));  // (1,8) : (0,1)
+    // in hopes of TLP
+    for (uint col = 0; col < size<2>(tCgC); ++col) {
+        copy(tCgC(_,_,col), tCgC_fragment);
+        axpby(alpha, tCrC(_,_,col), beta, tCgC_fragment);
+        copy(tCgC_fragment, tCgC(_,_,col));
+    }
 #endif
 
 /*
@@ -184,7 +191,15 @@ Vectorized 64-bit loads for B matrix in K-axis
         }
         ++gmem_tile_idx;
     }
-    axpby(alpha, tCrC, beta, tCgC);
+    // axpby(alpha, tCrC, beta, tCgC);  // TODO: uncoalesced stg
+    auto tCgC_fragment = make_fragment_like(tCrC(_,_,0));  // (1,8) : (0,1)
+    // in hopes of TLP
+    for (uint col = 0; col < size<2>(tCgC); ++col) {
+        copy(tCgC(_,_,col), tCgC_fragment);
+        axpby(alpha, tCrC(_,_,col), beta, tCgC_fragment);
+        copy(tCgC_fragment, tCgC(_,_,col));
+    }
+
 #endif
 }
 
@@ -206,6 +221,7 @@ void nn(int m, int n, int k, float alpha,
         make_shape(size<1>(cta_shape), size<2>(cta_shape), Int<n_pipes>{}),
         make_stride(size<2>(cta_shape), Int<1>{}, size<1>(cta_shape) * size<2>(cta_shape))
     );
+    auto sB_layout_swizzled = composition(Swizzle<1,2,3>{}, sB_layout);
     constexpr uint smem_size = (cosize_v<decltype(sA_layout)> + cosize_v<decltype(sB_layout)>) * sizeof(float);
 
     // at any given stage, tiled copy has 1 pipe of data in-flight
@@ -232,7 +248,7 @@ void nn(int m, int n, int k, float alpha,
         >{}
     );
     auto kernel = ampere_sgemm_128x32_3stage<decltype(stride_A), decltype(stride_B), decltype(stride_C),
-                                             decltype(sA_layout), decltype(sB_layout), decltype(cta_shape),
+                                             decltype(sA_layout), decltype(sB_layout_swizzled), decltype(cta_shape),
                                              decltype(copy_A), decltype(copy_B), decltype(mma)>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
@@ -240,7 +256,7 @@ void nn(int m, int n, int k, float alpha,
     dim3 block_dim(size(mma));
     dim3 grid_dim(size(ceil_div(m, select<0>(cta_shape))), size(ceil_div(n, select<1>(cta_shape))));
     kernel<<<grid_dim, block_dim, smem_size, nullptr>>>(
-        m, n, k, alpha, beta, A, stride_A, B, stride_B, C, stride_C, cta_shape, sA_layout, sB_layout, copy_A, copy_B, mma
+        m, n, k, alpha, beta, A, stride_A, B, stride_B, C, stride_C, cta_shape, sA_layout, sB_layout_swizzled, copy_A, copy_B, mma
     );
 #endif
 
