@@ -11,14 +11,29 @@
 #include "cutlass/predicated.cu"
 
 int main(int argc, char* argv[]) {
-    if (argc < 5) {
-        std::cerr << "Usage: " << argv[0] << " <kernel: int> <M: int> <N: int> <verify: bool>\n";
-        return 1;
+    int kernel = 0;
+    int M = 256;
+    int N = 256;
+    bool time = false;
+    bool check = false;
+
+    if (argc > 1) kernel = std::atoi(argv[1]);
+    if (argc > 2) M = std::atoi(argv[2]);
+    if (argc > 3) N = std::atoi(argv[3]);
+    if (argc > 4) time = bool(std::atoi(argv[4]));
+    if (argc > 5) check = bool(std::atoi(argv[5]));
+    if (argc == 2 && std::string(argv[1]) == "--help") {
+        std::cout << "Usage: " << argv[0]
+                  << " [kernel: int=0-2] [M: int=256] [N: int=256] [time: bool=0] [verify: bool=0]\n";
+        return 0;
     }
-    int kernel = std::atoi(argv[1]);
-    int M = std::atoi(argv[2]);
-    int N = std::atoi(argv[3]);
-    bool check = bool(std::atoi(argv[4]));
+
+    std::cout << "[Elementwise]: Running kernel=" << kernel
+              << " with M=" << M
+              << ", N=" << N
+              << " (time=" << time
+              << ", verify=" << check
+              << ")\n";
 
     using namespace cute;
     using dtype = float;
@@ -26,14 +41,11 @@ int main(int argc, char* argv[]) {
     auto hA = thrust::host_vector<dtype>(M * N);
     auto hB = thrust::host_vector<dtype>(M * N);
     auto hC = thrust::host_vector<dtype>(M * N);
-    // std::srand(static_cast<unsigned>(std::time(nullptr)));
-    // for (int i = 0; i < M * N; ++i) {
-    //     hA[i] = static_cast<dtype>(std::rand()) / static_cast<dtype>(RAND_MAX);
-    //     hB[i] = static_cast<dtype>(std::rand()) / static_cast<dtype>(RAND_MAX);
-    // }
-    std::iota(hA.begin(), hA.end(), 0);
-    std::iota(hB.begin(), hB.end(), 0);
-
+    std::srand(static_cast<unsigned>(std::time(nullptr)));
+    for (int i = 0; i < M * N; ++i) {
+        hA[i] = static_cast<dtype>(std::rand()) / static_cast<dtype>(RAND_MAX);
+        hB[i] = static_cast<dtype>(std::rand()) / static_cast<dtype>(RAND_MAX);
+    }
     auto dA = thrust::device_vector<dtype>(M * N);
     auto dB = thrust::device_vector<dtype>(M * N);
     auto dC = thrust::device_vector<dtype>(M * N, 0);
@@ -84,7 +96,7 @@ int main(int argc, char* argv[]) {
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
     }
-    else {
+    else if (kernel == 2) {
         assert(!(M % size<1>(val_layout)));
         assert(!(N % size<1>(val_layout)));
 

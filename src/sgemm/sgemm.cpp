@@ -8,11 +8,11 @@
 // #include "./cuda/onedim_tile.cu"
 // #include "./cuda/twodim_tile.cu"
 // #include "./cuda/vectorize.cu"
-// #include "./cuda/128x8_cg.cu"
+#include "./cuda/128x8_cg.cu"
 #include "./cuda/128x16.cu"
-// #include "./cuda/siboehm.cu"
+#include "./cuda/siboehm.cu"
 
-#include "./cutlass/sgemm_128x16_pipe.cu"
+// #include "./cutlass/sgemm_128x16_pipe.cu"
 #include "./cutlass/ampere_sgemm_128x32_3stage.cu"
 
 #include <cublas_v2.h>
@@ -33,16 +33,16 @@ namespace sgemm {
         // else if (kernel == 2) launch_onedim_threadtile(M, N, K, A, B, C, nullptr);
         // else if (kernel == 3) launch_twodim_threadtile(M, N, K, A, B, C, nullptr);
         // else if (kernel == 4) launch_vectorize(M, N, K, A, B, C, nullptr);
-        // else if (kernel == 5) launch_sgemm_128x8_cg(M, N, K, A, B, C, nullptr);
+        else if (kernel == 5) launch_sgemm_128x8_cg(M, N, K, A, B, C, nullptr);
         else if (kernel == 6) launch_sgemm_128x16(M, N, K, A, B, C, nullptr);
-        // else if (kernel == 7) launch_siboehm(M, N, K, 1.0, A, B, 0.0, C);
+        else if (kernel == 7) launch_siboehm(M, N, K, 1.0, A, B, 0.0, C);
         // // CUTLASS
-        else if (kernel == 8) launch_sgemm_128x16_pipe('N', 'N', N, M, K, 1.0, B, N, A, K, 0.0, C, N);
+        // else if (kernel == 8) launch_sgemm_128x16_pipe('N', 'N', N, M, K, 1.0, B, N, A, K, 0.0, C, N);
         else if (kernel == 9) launch_ampere_sgemm_128x32_3stage('N', 'N', N, M, K, 1.0, B, N, A, K, 0.0, C, N);
         // cuBLAS
         else if (kernel == 15) launch_cublas(handle, M, N, K, 1.0, A, B, 0.0, C);
     }  // TODO: maybe separate each kernel to have their own driver boilerplate--CUTLASS kernels get pretty nuanced
-}  // namespace sgem
+}  // namespace sgemm
 
 int main(int argc, char** argv) {
     int kernel = 0;
@@ -95,27 +95,49 @@ int main(int argc, char** argv) {
     dA = hA; dB = hB;
 
     if (time) {
+        for (int i = 0; i < 5; ++i)
+            sgemm::run_kernel(kernel, M, N, K, dA.data().get(), dB.data().get(), dC.data().get(), handle);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));
         CUDA_CHECK(cudaEventCreate(&stop));
-        sgemm::run_kernel(kernel, M, N, K, dA.data().get(), dB.data().get(), dC.data().get(), handle);
 
-        CUDA_CHECK(cudaEventRecord(start));
+        std::vector<float> trial_times;
+        trial_times.reserve(trials);
+
         for (int i = 0; i < trials; ++i) {
+            CUDA_CHECK(cudaEventRecord(start));
             sgemm::run_kernel(kernel, M, N, K, dA.data().get(), dB.data().get(), dC.data().get(), handle);
+            CUDA_CHECK(cudaEventRecord(stop));
+            CUDA_CHECK(cudaEventSynchronize(stop));
+            
+            float ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+            trial_times.push_back(ms);
         }
-        CUDA_CHECK(cudaEventRecord(stop));
-        CUDA_CHECK(cudaEventSynchronize(stop));
-        float milliseconds = 0;
-        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
-        float avg_time = milliseconds / trials;
 
-        float gflops = (2.0f * M * N * K) / (avg_time * 1e6);  // GFLOPS
-        float bandwidth = (M * K + K * N + M * N) * sizeof(float) / (avg_time * 1e6);  // GB/s
+        std::sort(trial_times.begin(), trial_times.end());
+        float best_ms   = trial_times.front();
+        float median_ms = trial_times[trials / 2];
 
-        std::cout << "[SGEMM]: Avg. walltime (" << trials << " trials): " << avg_time << " ms\n";       
-        std::cout << "[SGEMM]: Performance: " << gflops << " GFLOPS\n";
-        std::cout << "[SGEMM]: Bandwidth: " << bandwidth << "GB/s\n";
+        double sum = 0.0;
+        for (float t : trial_times) sum += t;
+        float avg_ms = (float)(sum / trials);
+
+        double var = 0.0;
+        for (float t : trial_times) { double d = t - avg_ms; var += d * d; }
+        float stddev = (float)std::sqrt(var / (trials - 1));
+
+        double flops = 2.0 * M * N * K;
+        double bytes = ((double)M * K + (double)K * N + (double)M * N) * sizeof(float);
+
+        std::cout << "[SGEMM] " << trials << " trials\n";
+        std::cout << "  time  : avg " << avg_ms << " ± " << stddev
+                << " ms | median " << median_ms << " ms | best " << best_ms << " ms\n";
+        std::cout << "  gflop/s: avg " << flops / (avg_ms    * 1e6)
+                << " | peak " << flops / (best_ms * 1e6) << "\n";
+        std::cout << "  bw.    : " << bytes / (best_ms * 1e6) << " GB/s (at peak)\n";
 
         CUDA_CHECK(cudaEventDestroy(start));
         CUDA_CHECK(cudaEventDestroy(stop));

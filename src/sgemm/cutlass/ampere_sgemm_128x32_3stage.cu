@@ -67,10 +67,10 @@ __global__ void ampere_sgemm_128x32_3stage(
     auto tCrC = make_fragment_like(tCgC);
     fill(tCrC, 0.0);
 
-#if 0
+#if 1
     if(thread0()) {
-        print(tiled_mma.thrfrg_A(sA)); print("\n");
-        print(tiled_mma.thrfrg_B(sB)); print("\n");
+        print(copy_A.tidfrg_S(sA)); print("\n");
+        print(copy_B.tidfrg_S(sB)); print("\n");
     }
 #endif
 
@@ -221,7 +221,6 @@ void nn(int m, int n, int k, float alpha,
         make_shape(size<1>(cta_shape), size<2>(cta_shape), Int<n_pipes>{}),
         make_stride(size<2>(cta_shape), Int<1>{}, size<1>(cta_shape) * size<2>(cta_shape))
     );
-    auto sB_layout_swizzled = composition(Swizzle<1,2,3>{}, sB_layout);
     constexpr uint smem_size = (cosize_v<decltype(sA_layout)> + cosize_v<decltype(sB_layout)>) * sizeof(float);
 
     // at any given stage, tiled copy has 1 pipe of data in-flight
@@ -238,6 +237,7 @@ void nn(int m, int n, int k, float alpha,
     );
 
 #if 1
+    auto sB_layout_swizzled = composition(Swizzle<1,2,3>{}, sB_layout);
     auto mma = make_tiled_mma(
         MMA_Atom<UniversalFMA<float>>{},
         Layout<Shape<_16,_16>>{},
@@ -302,8 +302,4 @@ void launch_ampere_sgemm_128x32_3stage(
     if (transA == 'N' && transB == 'N') {
         ampere_sgemm_128x32_3stage::nn(m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC);
     }
-    // using namespace cute;
-    // auto lt = make_layout(make_shape(_128{}, _32{}), LayoutRight{});
-    // auto swizzled = composition(Swizzle<3,2,6>{}, lt);
-    // print_latex(swizzled); print("\n");
 }
