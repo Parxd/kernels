@@ -9,7 +9,7 @@ def implicit_conv2d(
     v_act: cute.Tensor,
     filter: cute.Tensor,
     out: cute.Tensor,
-    h_w_stride_pad: cute.IntTuple, # 4-element packed tuple: image height, width, stride, padding
+    ih_iw_stride_pad: cute.IntTuple,  # 4-element packed tuple: image height, width, stride, padding
     sA_layout: cute.Layout,
     sB_layout: cute.Layout,
     tiler: cute.Shape,
@@ -20,6 +20,10 @@ def implicit_conv2d(
 ):
     tid, _, _ = cute.arch.thread_idx()
     bid_x, bid_y, _ = cute.arch.block_idx()
+    GEMM_M = cute.size(v_act, [0])
+    GEMM_N = cute.size(filter, [1])
+    GEMM_K = cute.size(v_act, [1])
+    ih, iw, stride, pad = ih_iw_stride_pad
     
     @cute.struct
     class SharedStorage:
@@ -35,17 +39,23 @@ def implicit_conv2d(
     storage = smem.allocate(SharedStorage.size_in_bytes(), byte_alignment=16)
     sA = SharedStorage(storage).a.get_tensor(sA_layout)
     sB = SharedStorage(storage).b.get_tensor(sB_layout)
-
-    GEMM_M = cute.size(v_act, [0])
-    GEMM_N = cute.size(filter, [1])
-    GEMM_K = cute.size(v_act, [1])
+    
     mA = cute.zipped_divide(v_act, (tiler[0], tiler[2]))
     mA_pred = cute.zipped_divide(cute.make_identity_tensor(v_act.shape), (tiler[0], tiler[2]))
     mB = cute.zipped_divide(filter, (tiler[1], tiler[2]))
+
+    out_npqk = cute.make_tensor(iterator=out.iterator, layout=cute.make_layout(
+        shape=((out.shape[0], out.shape[1], out.shape[2]), out.shape[3]),
+        stride=((out.shape[1] * out.shape[2] * out.shape[3], out.shape[2] * out.shape[3], out.shape[3]), 1)
+    ))
+    mC = cute.zipped_divide(out_npqk, (tiler[0], tiler[1]))
+    
     gA = mA[(None, None), (bid_y, None)]  # TODO: re-assign CTAs for better L2 use
-    gB = mB[(None, None), (bid_x, None)]
     gA_pred = mA_pred[(None, None), (bid_y, None)]
-    ih, iw, stride, pad = h_w_stride_pad
+    gB = mB[(None, None), (bid_x, None)]
+    gC = mC[(None, None), (bid_y, bid_x)]
+    K_ITERS = cute.size(gA, [2])
+    PIPES = sA.shape[2]
 
     g2s_thr_copy_A = g2s_tiled_copy_A.get_slice(tid)
     g2s_thr_copy_B = g2s_tiled_copy_B.get_slice(tid)
@@ -54,20 +64,55 @@ def implicit_conv2d(
     tAsA = g2s_thr_copy_A.partition_D(sA)
     tBgB = g2s_thr_copy_B.partition_S(gB)
     tBsB = g2s_thr_copy_B.partition_D(sB)
+    tAsA.fill(0.0)
+    tBsB.fill(0.0)
 
     tApA = cute.make_rmem_tensor(
         layout_or_shape=cute.make_layout(
-            (tAgA.shape[0][1], tAgA.shape[1], tAgA.shape[2], cute.size(tAgA, [3]))
+            (tAgA.shape[0][1], tAgA.shape[1], tAgA.shape[2], tAgA.shape[3])
         ),
         dtype=cutlass.Boolean
     )
     for frg_x in cutlass.range_constexpr(tApA.shape[0]):
         for rest_m in cutlass.range_constexpr(tApA.shape[1]):
-            # for rest_n in cutlass.range_constexpr(tApA.shape[2]):
-            for rest_k in cutlass.range_constexpr(tApA.shape[3]):
-                (_, p, q), (r, s, _) = tAmA_pred[frg_x, rest_m, 0, rest_k] 
-                h, w = p * stride + r, q * stride + s
-                tApA[frg_x, rest_m, 0, rest_k] =  h >= pad and w >= pad and h < ih - pad and w < iw - pad
+            for rest_n in cutlass.range_constexpr(tApA.shape[2]):
+                for rest_k in cutlass.range_constexpr(cute.size(tApA, [3])):
+                    (_, p, q), (r, s, _) = tAmA_pred[frg_x, rest_m, rest_n, rest_k] 
+                    h, w = p * stride + r, q * stride + s
+                    tApA[frg_x, rest_m, rest_n, rest_k] = h >= pad and w >= pad and h < ih + pad and w < iw + pad
+
+    s2r_tiled_copy_A = cute.make_tiled_copy_A(s2r_copy_atom, tiled_mma)
+    s2r_tiled_copy_B = cute.make_tiled_copy_B(s2r_copy_atom, tiled_mma)
+    thr_mma = tiled_mma.get_slice(tid)
+    s2r_thr_copy_A = s2r_tiled_copy_A.get_slice(tid)
+    s2r_thr_copy_B = s2r_tiled_copy_B.get_slice(tid)
+
+    tCsA = thr_mma.partition_A(sA)
+    tCsB = thr_mma.partition_B(sB)
+    tCgC = thr_mma.partition_C(gC)
+    tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
+    tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
+    tCrC = tiled_mma.make_fragment_C(tCgC)
+    tCsA_copy = s2r_thr_copy_A.partition_S(sA)
+    tCrA_copy = s2r_thr_copy_A.retile(tCrA)
+    tCsB_copy = s2r_thr_copy_B.partition_S(sB)
+    tCrB_copy = s2r_thr_copy_B.retile(tCrB)
+    tCrC.fill(0.0)
+
+    for k_iter in range(K_ITERS):
+        cute.arch.sync_threads()
+        cute.copy(g2s_thr_copy_A, tAgA[None, None, None, k_iter], tAsA[None, None, None, 0], pred=tApA[None, None, None, k_iter])
+        cute.copy(g2s_thr_copy_B, tBgB[None, None, None, k_iter], tBsB[None, None, None, 0])
+
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+
+        cute.copy(s2r_tiled_copy_A, tCsA_copy[None, None, None, 0], tCrA_copy)
+        cute.copy(s2r_tiled_copy_B, tCsB_copy[None, None, None, 0], tCrB_copy)
+        cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)
+    cute.autovec_copy(tCrC, tCgC)
+    return
 
 
 @cute.jit
@@ -75,9 +120,8 @@ def entry(
     activations: cute.Tensor,
     filter: cute.Tensor,
     out: cute.Tensor,
-    stride: cutlass.Constexpr = 2,
-    pad: cutlass.Constexpr = 1,
-    num_threads: cutlass.Constexpr = 256
+    stride: cutlass.Constexpr,
+    pad: cutlass.Constexpr
 ):
     batch_size, height, width, in_channels = activations.shape
     out_channels, filter_height, filter_width, _ = filter.shape
@@ -89,7 +133,10 @@ def entry(
     tiler_m = (1, TILE_P, TILE_Q)
     tiler_n = out_channels
     tiler_k = (1, 1, in_channels)
-    num_stages = 3
+    num_stages = 1
+
+    MMA_TILE = (2, 4, 1)
+    num_threads = cute.size(MMA_TILE) * 32
     # --------------------------
 
     v_act_lt = cute.make_layout(
@@ -98,13 +145,16 @@ def entry(
             (filter_height, filter_width, in_channels)
         ),
         stride=(
-            ((height + pad * 2) * (width + pad * 2) * in_channels, (width + pad * 2) * in_channels, in_channels),
-            (in_channels * filter_width, in_channels, 1)
+            (height * width * in_channels, stride * width * in_channels, stride * in_channels),
+            (width * in_channels, in_channels, 1)
         )
     )
     v_act = cute.domain_offset(
-        ((0, -pad, -pad), (0, 0, 0)),  # point iterator to negative OOB memory, will use predicate to avoid segfault
-        cute.make_tensor(iterator=activations.iterator.align(16), layout=v_act_lt)
+        ((0, 0, 0), (-pad, -pad, 0)),  # offset (r,s) to shift base pointer by -pad in h,w
+        cute.make_tensor(iterator=activations.iterator.align(in_channels * 2), layout=v_act_lt)
+    )
+    filter = cute.make_tensor(
+        iterator=filter.iterator.align(in_channels * 2), layout=filter.layout
     )
     grouped_filter = cute.group_modes(filter, 1, 4)
     sA_layout = cute.make_ordered_layout((cute.size(tiler_m), cute.size(tiler_k), num_stages), order=(1, 0, 2))
@@ -136,7 +186,7 @@ def entry(
     s2r_copy_atom = cute.make_copy_atom(
         op=cute.nvgpu.warp.LdMatrix8x8x16bOp(
             transpose=False,
-            num_matrices=1
+            num_matrices=4
         ),
         copy_internal_type=cutlass.Float16
     )
@@ -147,7 +197,11 @@ def entry(
             shape_mnk=(16, 8, 16)
         )
     )
-    tiled_mma = cute.make_tiled_mma(mma_atom)
+    tiled_mma = cute.make_tiled_mma(
+        op_or_atom=mma_atom,
+        atom_layout_mnk=MMA_TILE,
+        # permutation_mnk=...
+    )
     
     grid_dim = cute.ceil_div(
         (out_channels, batch_size * out_height * out_width),
@@ -176,19 +230,21 @@ def main():
     P = (H + 2 * PAD - R) // STRIDE + 1
     Q = (W + 2 * PAD - S) // STRIDE + 1
 
-    # activations_nhwc = torch.rand((N, H, W, C), dtype=torch.float16, device='cuda')
-    # filter = torch.rand((K, R, S, C), dtype=torch.float16, device='cuda')
-    # ref = torch.conv2d(
-        # activations_nhwc.permute(0, 3, 1, 2).contiguous(),  # NHWC -> NCHW
-        # filter
-        # pad=1
-    # ).permute(0, 2, 3, 1).contiguous()  # NCHW -> NHWC
-    # print(ref.shape)
+    activations = torch.randn((N, H, W, C), dtype=torch.float16).to('cuda')
+    filter = torch.randn((K, R, S, C), dtype=torch.float16).to('cuda')
+    out = torch.empty((N, P, Q, K), dtype=torch.float32).to('cuda')
+    entry(from_dlpack(activations), from_dlpack(filter), from_dlpack(out), STRIDE, PAD)
 
-    test_activations = torch.randn((N, H, W, C), dtype=torch.float16).to('cuda')
-    test_filter = torch.randn((K, R, S, C), dtype=torch.float16).to('cuda')
-    test_out = torch.empty((N, P, Q, K), dtype=torch.float16).to('cuda')
-    entry(from_dlpack(test_activations), from_dlpack(test_filter), from_dlpack(test_out))
+    ref = torch.nn.functional.conv2d(
+        activations.permute(0, 3, 1, 2).contiguous().float(),
+        filter.permute(0, 3, 1, 2).contiguous().float(),
+        stride=STRIDE,
+        padding=PAD
+    ).permute(0, 2, 3, 1).contiguous()
+
+    print(f"max err.: {(out - ref).abs().max().item()}")
+    print(f"correct: {torch.allclose(out, ref, atol=1e-1, rtol=1e-2)}")
+
 
 if __name__ == "__main__":
     main()
