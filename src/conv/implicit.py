@@ -43,12 +43,7 @@ def implicit_conv2d(
     mA = cute.zipped_divide(v_act, (tiler[0], tiler[2]))
     mA_pred = cute.zipped_divide(cute.make_identity_tensor(v_act.shape), (tiler[0], tiler[2]))
     mB = cute.zipped_divide(filter, (tiler[1], tiler[2]))
-
-    out_npqk = cute.make_tensor(iterator=out.iterator, layout=cute.make_layout(
-        shape=((out.shape[0], out.shape[1], out.shape[2]), out.shape[3]),
-        stride=((out.shape[1] * out.shape[2] * out.shape[3], out.shape[2] * out.shape[3], out.shape[3]), 1)
-    ))
-    mC = cute.zipped_divide(out_npqk, (tiler[0], tiler[1]))
+    mC = cute.zipped_divide(out, (tiler[0], tiler[1]))
     
     gA = mA[(None, None), (bid_y, None)]  # TODO: re-assign CTAs for better L2 use
     gA_pred = mA_pred[(None, None), (bid_y, None)]
@@ -111,6 +106,9 @@ def implicit_conv2d(
         cute.copy(s2r_tiled_copy_A, tCsA_copy[None, None, None, 0], tCrA_copy)
         cute.copy(s2r_tiled_copy_B, tCsB_copy[None, None, None, 0], tCrB_copy)
         cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)
+    # tCrD = cute.make_fragment_like(tCrC, dtype=cutlass.Float16)
+    # tCrD[None] = tCrC.load().to(cutlass.Float16)
+    # cute.autovec_copy(tCrD, tCgC)
     cute.autovec_copy(tCrC, tCgC)
     return
 
@@ -135,7 +133,7 @@ def entry(
     tiler_k = (1, 1, in_channels)
     num_stages = 1
 
-    MMA_TILE = (2, 4, 1)
+    MMA_TILE = (2, 2, 1)
     num_threads = cute.size(MMA_TILE) * 32
     # --------------------------
 
@@ -157,6 +155,7 @@ def entry(
         iterator=filter.iterator.align(in_channels * 2), layout=filter.layout
     )
     grouped_filter = cute.group_modes(filter, 1, 4)
+    grouped_out = cute.group_modes(out, 0, 3)
     sA_layout = cute.make_ordered_layout((cute.size(tiler_m), cute.size(tiler_k), num_stages), order=(1, 0, 2))
     sB_layout = cute.make_ordered_layout((cute.size(tiler_n), cute.size(tiler_k), num_stages), order=(1, 0, 2))
     
@@ -210,7 +209,7 @@ def entry(
     implicit_conv2d(
         v_act,
         grouped_filter,
-        out,
+        grouped_out,
         (height, width, stride, pad),
         sA_layout, sB_layout,
         (tiler_m, tiler_n, tiler_k),
@@ -236,11 +235,11 @@ def main():
     entry(from_dlpack(activations), from_dlpack(filter), from_dlpack(out), STRIDE, PAD)
 
     ref = torch.nn.functional.conv2d(
-        activations.permute(0, 3, 1, 2).contiguous().float(),
-        filter.permute(0, 3, 1, 2).contiguous().float(),
+        activations.permute(0, 3, 1, 2).contiguous(),
+        filter.permute(0, 3, 1, 2).contiguous(),
         stride=STRIDE,
         padding=PAD
-    ).permute(0, 2, 3, 1).contiguous()
+    ).permute(0, 2, 3, 1).contiguous().float()
 
     print(f"max err.: {(out - ref).abs().max().item()}")
     print(f"correct: {torch.allclose(out, ref, atol=1e-1, rtol=1e-2)}")
