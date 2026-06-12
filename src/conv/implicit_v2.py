@@ -15,7 +15,8 @@ def implicit_conv2d(
     tiler: cute.Shape,
     g2s_tiled_copy_A: cute.TiledCopy,
     g2s_tiled_copy_B: cute.TiledCopy,
-    s2r_copy_atom: cute.CopyAtom,
+    s2r_copy_atom_A: cute.CopyAtom,
+    s2r_copy_atom_B: cute.CopyAtom,
     tiled_mma: cute.TiledMma,
 ):
     tid, _, _ = cute.arch.thread_idx()
@@ -77,8 +78,8 @@ def implicit_conv2d(
                     h, w = p * stride + r, q * stride + s
                     tApA[frg_x, rest_m, rest_n, rest_k] = h >= pad and w >= pad and h < ih + pad and w < iw + pad
 
-    s2r_tiled_copy_A = cute.make_tiled_copy_A(s2r_copy_atom, tiled_mma)
-    s2r_tiled_copy_B = cute.make_tiled_copy_B(s2r_copy_atom, tiled_mma)
+    s2r_tiled_copy_A = cute.make_tiled_copy_A(s2r_copy_atom_A, tiled_mma)
+    s2r_tiled_copy_B = cute.make_tiled_copy_B(s2r_copy_atom_B, tiled_mma)
     thr_mma = tiled_mma.get_slice(tid)
     s2r_thr_copy_A = s2r_tiled_copy_A.get_slice(tid)
     s2r_thr_copy_B = s2r_tiled_copy_B.get_slice(tid)
@@ -86,18 +87,20 @@ def implicit_conv2d(
     tCsA = thr_mma.partition_A(sA)
     tCsB = thr_mma.partition_B(sB)
     tCgC = thr_mma.partition_C(gC)
+    (_, mma_atom_m), mma_tile_m, mma_tile_k = tCgC.shape
+
     tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
     tCrA = cute.composition(tCrA, (None, None, R_PIPES))
     tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
     tCrB = cute.composition(tCrB, (None, None, R_PIPES))
     tCrC = tiled_mma.make_fragment_C(tCgC)
     tCrC_reshape = cute.make_rmem_tensor(
-        cute.make_layout(((2, 2, 2), 2, 2), stride=((1, 2, 4), 8, 16)),
+        cute.make_layout(((2, 2, 2), mma_atom_m, mma_tile_m), stride=((1, 2, 4), 8, 8 * mma_atom_m)),
         dtype=cutlass.Float16
     )
     tCgC_reshape = cute.make_tensor(
-        tCgC.iterator.align(16),
-        cute.make_layout((8, 2, 2), stride=(1, 64, 512))
+        tCgC.iterator.align(16),  # 8x fp16 = 16-byte align
+        cute.make_layout((8, mma_atom_m, mma_tile_m), stride=(1, tCgC.stride[0][1], tCgC.stride[1]))
     )
     tCsA_copy = s2r_thr_copy_A.partition_S(sA)
     tCrA_copy = s2r_thr_copy_A.retile(tCrA)
@@ -153,11 +156,12 @@ def implicit_conv2d(
             cute.copy(s2r_tiled_copy_B, tCsB_copy[None, None, 0, pipe_r], tCrB_copy[None, None, block_idx])
         tile_idx += 1
     
+    # reorder register fragments from MMA to vectorize r2g stores 
     r2r_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float16)
-    for atom_k in cutlass.range_constexpr(2):
-        for tile_m in cutlass.range_constexpr(2):
-            for tile_k in cutlass.range_constexpr(4):
-                cute.copy(r2r_atom, tCrC[(None, atom_k), tile_m, tile_k], tCrC_reshape[(None, tile_k % 2, tile_k // 2), atom_k, tile_m])
+    for atom_m in cutlass.range_constexpr(mma_atom_m):
+        for tile_m in cutlass.range_constexpr(mma_tile_m):
+            for tile_k in cutlass.range_constexpr(mma_tile_k):
+                cute.copy(r2r_atom, tCrC[(None, atom_m), tile_m, tile_k], tCrC_reshape[(None, tile_k % 2, tile_k // 2), atom_m, tile_m])
     r2g_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float16, num_bits_per_copy=8*cutlass.Float16.width)
     cute.copy(r2g_atom, tCrC_reshape, tCgC_reshape)
     return
@@ -218,8 +222,7 @@ def entry(
         )
     )
     sB_layout = cute.make_composed_layout(
-        inner=cute.make_swizzle(b=0, m=4, s=3),
-        # inner=cute.make_swizzle(b=2, m=3, s=3),
+        inner=cute.make_swizzle(b=2, m=3, s=5),
         offset=0,
         outer=cute.make_ordered_layout(
             (cute.size(tiler_n), cute.size(tiler_k), num_stages), order=(1, 0, 2)
@@ -248,10 +251,17 @@ def entry(
     g2s_copy_A = cute.make_tiled_copy_tv(g2s_copy_atom, tA, vA)
     g2s_copy_B = cute.make_tiled_copy_tv(g2s_copy_atom, tB, vB)
 
-    s2r_copy_atom = cute.make_copy_atom(
+    s2r_copy_atom_A = cute.make_copy_atom(
         op=cute.nvgpu.warp.LdMatrix8x8x16bOp(
             transpose=False,
             num_matrices=4
+        ),
+        copy_internal_type=cutlass.Float16
+    )
+    s2r_copy_atom_B = cute.make_copy_atom(
+        op=cute.nvgpu.warp.LdMatrix8x8x16bOp(
+            transpose=False,
+            num_matrices=2
         ),
         copy_internal_type=cutlass.Float16
     )
@@ -267,7 +277,6 @@ def entry(
         atom_layout_mnk=MMA_TILE,
         permutation_mnk=(
             64,
-            # 32,
             cute.make_layout((2, 4, 4), stride=(1, 8, 2)),
             16
         )
@@ -285,7 +294,8 @@ def entry(
         sA_layout, sB_layout,
         (tiler_m, tiler_n, tiler_k),
         g2s_copy_A, g2s_copy_B,
-        s2r_copy_atom,
+        s2r_copy_atom_A,
+        s2r_copy_atom_B,
         tiled_mma,
     ).launch(
         grid=grid_dim,
@@ -305,21 +315,21 @@ def main():
     out = torch.empty((N, P, Q, K), dtype=torch.float16).to('cuda')
     entry(from_dlpack(activations), from_dlpack(filter), from_dlpack(out), STRIDE, PAD)
 
-    torch.backends.cudnn.allow_tf32 = False  # keep fp16 strict
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-    with torch.backends.cudnn.flags(enabled=True, benchmark=True):
-        ref = torch.nn.functional.conv2d(
-            activations.permute(0, 3, 1, 2).contiguous(),
-            filter.permute(0, 3, 1, 2).contiguous(),
-            stride=STRIDE,
-            padding=PAD
-        ).permute(0, 2, 3, 1).contiguous()
-    # ref = torch.nn.functional.conv2d(
-    #     activations.permute(0, 3, 1, 2).contiguous(),
-    #     filter.permute(0, 3, 1, 2).contiguous(),
-    #     stride=STRIDE,
-    #     padding=PAD
-    # ).permute(0, 2, 3, 1).contiguous()
+    # torch.backends.cudnn.allow_tf32 = False  # keep fp16 strict
+    # torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    # with torch.backends.cudnn.flags(enabled=True, benchmark=True):
+    #     ref = torch.nn.functional.conv2d(
+    #         activations.permute(0, 3, 1, 2).contiguous(),
+    #         filter.permute(0, 3, 1, 2).contiguous(),
+    #         stride=STRIDE,
+    #         padding=PAD
+    #     ).permute(0, 2, 3, 1).contiguous()
+    ref = torch.nn.functional.conv2d(
+        activations.permute(0, 3, 1, 2).contiguous(),
+        filter.permute(0, 3, 1, 2).contiguous(),
+        stride=STRIDE,
+        padding=PAD
+    ).permute(0, 2, 3, 1).contiguous()
     print(f"max err.: {(out - ref).abs().max().item()}")
     print(f"correct: {torch.allclose(out, ref, atol=1e-1, rtol=1e-2)}")
 
