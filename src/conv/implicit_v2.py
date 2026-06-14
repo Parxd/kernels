@@ -45,11 +45,13 @@ def implicit_conv2d(
     mA_pred = cute.zipped_divide(cute.make_identity_tensor(v_act.shape), (tiler[0], tiler[2]))
     mB = cute.zipped_divide(filter, (tiler[1], tiler[2]))
     mC = cute.zipped_divide(out, (tiler[0], tiler[1]))
+    mC_pred = cute.zipped_divide(cute.make_identity_tensor(out.shape), (tiler[0], tiler[1]))
     
     gA = mA[(None, None), (bid_y, None)]  # TODO: re-assign CTAs for better L2 use
     gA_pred = mA_pred[(None, None), (bid_y, None)]
     gB = mB[(None, None), (bid_x, None)]
     gC = mC[(None, None), (bid_y, bid_x)]
+    gC_pred = mC_pred[(None, None), (bid_y, bid_x)]
     TILES = cute.size(gA, [2])
     S_PIPES = sA.shape[2]
     R_PIPES = 2
@@ -87,6 +89,7 @@ def implicit_conv2d(
     tCsA = thr_mma.partition_A(sA)
     tCsB = thr_mma.partition_B(sB)
     tCgC = thr_mma.partition_C(gC)
+    tCmC_pred = thr_mma.partition_C(gC_pred)
     (_, mma_atom_m), mma_tile_m, mma_tile_k = tCgC.shape
 
     tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
@@ -95,13 +98,27 @@ def implicit_conv2d(
     tCrB = cute.composition(tCrB, (None, None, R_PIPES))
     tCrC = tiled_mma.make_fragment_C(tCgC)
     tCrC_reshape = cute.make_rmem_tensor(
-        cute.make_layout(((2, 2, 2), mma_atom_m, mma_tile_m), stride=((1, 2, 4), 8, 8 * mma_atom_m)),
+        cute.make_layout(
+            (((2, 2, 2), 1), mma_atom_m, mma_tile_m),
+            stride=(((1, 2, 4), 0), 8, 8 * mma_atom_m)
+        ),
         dtype=cutlass.Float16
     )
     tCgC_reshape = cute.make_tensor(
         tCgC.iterator.align(16),  # 8x fp16 = 16-byte align
-        cute.make_layout((8, mma_atom_m, mma_tile_m), stride=(1, tCgC.stride[0][1], tCgC.stride[1]))
+        cute.make_layout(
+            ((8, 1), mma_atom_m, mma_tile_m),
+            stride=((1, 0), tCgC.stride[0][1], tCgC.stride[1])
+        )
     )
+    tCpC = cute.make_rmem_tensor(
+        layout_or_shape=cute.make_layout((1, mma_atom_m, mma_tile_m)),
+        dtype=cutlass.Boolean
+    )
+    for atom_m in cutlass.range_constexpr(mma_atom_m):
+        for tile_m in cutlass.range_constexpr(mma_tile_m):
+            ((_, p, q), _) = tCmC_pred[(0, atom_m), tile_m, 0]
+            tCpC[0, atom_m, tile_m] = p < v_act.shape[0][1] and q < v_act.shape[0][2]
     tCsA_copy = s2r_thr_copy_A.partition_S(sA)
     tCrA_copy = s2r_thr_copy_A.retile(tCrA)
     tCsB_copy = s2r_thr_copy_B.partition_S(sB)
@@ -161,9 +178,9 @@ def implicit_conv2d(
     for atom_m in cutlass.range_constexpr(mma_atom_m):
         for tile_m in cutlass.range_constexpr(mma_tile_m):
             for tile_k in cutlass.range_constexpr(mma_tile_k):
-                cute.copy(r2r_atom, tCrC[(None, atom_m), tile_m, tile_k], tCrC_reshape[(None, tile_k % 2, tile_k // 2), atom_m, tile_m])
+                cute.copy(r2r_atom, tCrC[(None, atom_m), tile_m, tile_k], tCrC_reshape[((None, tile_k % 2, tile_k // 2), 0), atom_m, tile_m])
     r2g_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Float16, num_bits_per_copy=8*cutlass.Float16.width)
-    cute.copy(r2g_atom, tCrC_reshape, tCgC_reshape)
+    cute.copy(r2g_atom, tCrC_reshape, tCgC_reshape, pred=tCpC)
     return
 
 
@@ -282,10 +299,9 @@ def entry(
         )
     )
 
-    grid_dim = cute.ceil_div(
-        (out_channels, batch_size * out_height * out_width),
-        (cute.size(tiler_n), cute.size(tiler_m))
-    )
+    grid_dim_m = batch_size * cute.ceil_div(out_height, TILE_P) * cute.ceil_div(out_width, TILE_Q)
+    grid_dim_n = cute.ceil_div(out_channels, cute.size(tiler_n))
+    grid_dim = (grid_dim_n, grid_dim_m)
     implicit_conv2d(
         v_act,
         grouped_filter,
@@ -315,21 +331,21 @@ def main():
     out = torch.empty((N, P, Q, K), dtype=torch.float16).to('cuda')
     entry(from_dlpack(activations), from_dlpack(filter), from_dlpack(out), STRIDE, PAD)
 
-    # torch.backends.cudnn.allow_tf32 = False  # keep fp16 strict
-    # torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-    # with torch.backends.cudnn.flags(enabled=True, benchmark=True):
-    #     ref = torch.nn.functional.conv2d(
-    #         activations.permute(0, 3, 1, 2).contiguous(),
-    #         filter.permute(0, 3, 1, 2).contiguous(),
-    #         stride=STRIDE,
-    #         padding=PAD
-    #     ).permute(0, 2, 3, 1).contiguous()
-    ref = torch.nn.functional.conv2d(
-        activations.permute(0, 3, 1, 2).contiguous(),
-        filter.permute(0, 3, 1, 2).contiguous(),
-        stride=STRIDE,
-        padding=PAD
-    ).permute(0, 2, 3, 1).contiguous()
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    with torch.backends.cudnn.flags(enabled=True, benchmark=True):
+        ref = torch.nn.functional.conv2d(
+            activations.permute(0, 3, 1, 2).contiguous(),
+            filter.permute(0, 3, 1, 2).contiguous(),
+            stride=STRIDE,
+            padding=PAD
+        ).permute(0, 2, 3, 1).contiguous()
+    # ref = torch.nn.functional.conv2d(
+    #     activations.permute(0, 3, 1, 2).contiguous(),
+    #     filter.permute(0, 3, 1, 2).contiguous(),
+    #     stride=STRIDE,
+    #     padding=PAD
+    # ).permute(0, 2, 3, 1).contiguous()
     print(f"max err.: {(out - ref).abs().max().item()}")
     print(f"correct: {torch.allclose(out, ref, atol=1e-1, rtol=1e-2)}")
 
