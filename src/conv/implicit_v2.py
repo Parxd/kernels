@@ -144,11 +144,6 @@ def implicit_conv2d(
     BLOCKS = cute.size(tCsA, [2])
     K_ITERS = TILES + (S_PIPES - 1)
 
-    cute.arch.cp_async_wait_group(S_PIPES - 2)
-    cute.arch.sync_threads()
-    cute.copy(s2r_tiled_copy_A, tCsA_copy[None, None, 0, pipe_r], tCrA_copy[None, None, block_idx])
-    cute.copy(s2r_tiled_copy_B, tCsB_copy[None, None, 0, pipe_r], tCrB_copy[None, None, block_idx])
-
     for k_iter in range(K_ITERS):
         for block in cutlass.range_constexpr(BLOCKS - 1):
             cute.copy(s2r_tiled_copy_A, tCsA_copy[None, None, block + 1, pipe_r], tCrA_copy[None, None, block_idx ^ 1])
