@@ -92,8 +92,8 @@ def implicit_conv2d(
         for rest_m in cutlass.range_constexpr(tBpB.shape[1]):
             for rest_n in cutlass.range_constexpr(tBpB.shape[2]):
                 for rest_k in range(cute.size(tBpB, [3])):
-                    (_, (_, _, c)) = tBmB_pred[frg_x, rest_m, rest_n, rest_k]
-                    tBpB[frg_x, rest_m, rest_n, rest_k] = c < v_act.shape[1][2]
+                    (k, (_, _, c)) = tBmB_pred[frg_x, rest_m, rest_n, rest_k]
+                    tBpB[frg_x, rest_m, rest_n, rest_k] = k < filter.shape[0] and c < v_act.shape[1][2]
 
     s2r_tiled_copy_A = cute.make_tiled_copy_A(s2r_copy_atom_A, tiled_mma)
     s2r_tiled_copy_B = cute.make_tiled_copy_B(s2r_copy_atom_B, tiled_mma)
@@ -130,8 +130,8 @@ def implicit_conv2d(
     )
     for atom_m in cutlass.range_constexpr(mma_atom_m):
         for tile_m in cutlass.range_constexpr(mma_tile_m):
-            ((_, p, q), _) = tCmC_pred[(0, atom_m), tile_m, 0]
-            tCpC[0, atom_m, tile_m] = p < v_act.shape[0][1] and q < v_act.shape[0][2]
+            ((_, p, q), k) = tCmC_pred[(0, atom_m), tile_m, 0]
+            tCpC[0, atom_m, tile_m] = p < v_act.shape[0][1] and q < v_act.shape[0][2] and k < filter.shape[0]
 
     tCsA_copy = s2r_thr_copy_A.partition_S(sA)
     tCrA_copy = s2r_thr_copy_A.retile(tCrA)
@@ -319,7 +319,7 @@ def entry(
 def main():
     STRIDE, PAD = 2, 1
     N, H, W, C = 1, 320, 320, 40
-    K, R, S = 32, 3, 3
+    K, R, S = 40, 3, 3
     P = (H + 2 * PAD - R) // STRIDE + 1
     Q = (W + 2 * PAD - S) // STRIDE + 1
 
