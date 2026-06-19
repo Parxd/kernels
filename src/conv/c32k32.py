@@ -1,7 +1,5 @@
-import torch
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 
 
 @cute.kernel
@@ -193,7 +191,7 @@ def implicit_conv2d(
 
 
 @cute.jit
-def entry(
+def static_entry(
     activations: cute.Tensor,
     filter: cute.Tensor,
     out: cute.Tensor,
@@ -324,36 +322,25 @@ def entry(
     )
 
 
-def main():
-    STRIDE, PAD = 2, 1
-    N, H, W, C = 1, 320, 320, 40
-    K, R, S = 96, 3, 3
-    P = (H + 2 * PAD - R) // STRIDE + 1
-    Q = (W + 2 * PAD - S) // STRIDE + 1
-
-    activations = torch.randn((N, H, W, C), dtype=torch.float16).to('cuda')
-    filter = torch.randn((K, R, S, C), dtype=torch.float16).to('cuda')
-    out = torch.empty((N, P, Q, K), dtype=torch.float16).to('cuda')
-    entry(from_dlpack(activations), from_dlpack(filter), from_dlpack(out), STRIDE, PAD)
-
-    torch.backends.cudnn.allow_tf32 = False
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-    with torch.backends.cudnn.flags(enabled=True, benchmark=True):
-        ref = torch.nn.functional.conv2d(
-            activations.permute(0, 3, 1, 2).contiguous(),
-            filter.permute(0, 3, 1, 2).contiguous(),
-            stride=STRIDE,
-            padding=PAD
-        ).permute(0, 2, 3, 1).contiguous()
-    # ref = torch.nn.functional.conv2d(
-        # activations.permute(0, 3, 1, 2).contiguous(),
-        # filter.permute(0, 3, 1, 2).contiguous(),
-        # stride=STRIDE,
-        # padding=PAD
-    # ).permute(0, 2, 3, 1).contiguous()
-    print(f"max err.: {(out - ref).abs().max().item()}")
-    print(f"correct: {torch.allclose(out, ref, atol=1e-1, rtol=1e-2)}")
-
-
-if __name__ == "__main__":
-    main()
+@cute.jit
+def dynamic_entry(
+    activations_ptr: cute.Pointer,
+    filter_ptr: cute.Pointer,
+    out_ptr: cute.Pointer,
+    N: cutlass.Int32,
+    H: cutlass.Int32,
+    W: cutlass.Int32,
+    C: cutlass.Int32,
+    K: cutlass.Int32,
+    R: cutlass.Int32,
+    S: cutlass.Int32,
+    P: cutlass.Int32,
+    Q: cutlass.Int32,
+    stride: cutlass.Int32,
+    pad: cutlass.Int32
+):
+    C = cute.assume(C, divby=8)
+    activations = cute.make_tensor(activations_ptr, cute.make_ordered_layout((N, H, W, C), order=(3, 2, 1, 0)))
+    filter = cute.make_tensor(filter_ptr, cute.make_ordered_layout((K, R, S, C), order=(3, 2, 1, 0)))
+    out = cute.make_tensor(out_ptr, cute.make_ordered_layout((N, P, Q, K), order=(3, 2, 1, 0)))
+    static_entry(activations, filter, out, stride, pad)
