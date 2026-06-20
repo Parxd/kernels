@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 WARMUP_ITERS = 10
 TIMED_ITERS = 50
+M_TILER_THRESHOLD = 1600  # TODO: tune to find optimal value here
 
 
 def time_kernel_avg(fn, *args):
@@ -78,6 +79,9 @@ def common_shapes():
     shapes.append(ConvShape("unet_enc", 8, 128, 128, 64, 128, 3, 3, 1, 1))
     shapes.append(ConvShape("unet_dec", 8, 128, 128, 128, 64, 3, 3, 1, 1))
 
+    shapes.append(ConvShape("m-test1", 1, 30, 30, 128, 64, 3, 3, 1, 1))
+    shapes.append(ConvShape("m-test2", 2, 40, 40, 128, 64, 3, 3, 1, 1))
+
     return shapes
 
 
@@ -94,7 +98,7 @@ def run_one(shape: ConvShape):
     act_cute = from_dlpack(activations)
     weight_cute = from_dlpack(weight)
     out_cute = from_dlpack(out)
-    if shape.H < 40 and shape.W < 40:
+    if shape.N * shape.H * shape.W < M_TILER_THRESHOLD:
         compiled = cute.compile(static_entry, act_cute, weight_cute, out_cute, STRIDE, PAD, 64)
     else:
         compiled = cute.compile(static_entry, act_cute, weight_cute, out_cute, STRIDE, PAD, 128)
