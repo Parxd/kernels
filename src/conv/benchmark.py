@@ -69,6 +69,8 @@ def common_shapes():
 
     shapes.append(ConvShape("yolo_head", 8, 80, 80, 256, 256, 3, 3, 1, 1))
     shapes.append(ConvShape("yolo_neck", 8, 40, 40, 512, 256, 1, 1, 1, 0))
+    shapes.append(ConvShape("yolov11_layer2", 8, 320, 320, 32, 64, 3, 3, 2, 1))
+    shapes.append(ConvShape("yolov11_layer3", 8, 160, 160, 64, 64, 3, 3, 1, 0))
 
     shapes.append(ConvShape("vgg_early", 8, 224, 224, 64, 64, 3, 3, 1, 1))
     shapes.append(ConvShape("vgg_mid", 8, 112, 112, 128, 128, 3, 3, 1, 1))
@@ -92,7 +94,10 @@ def run_one(shape: ConvShape):
     act_cute = from_dlpack(activations)
     weight_cute = from_dlpack(weight)
     out_cute = from_dlpack(out)
-    compiled = cute.compile(static_entry, act_cute, weight_cute, out_cute, STRIDE, PAD)
+    if shape.H < 40 and shape.W < 40:
+        compiled = cute.compile(static_entry, act_cute, weight_cute, out_cute, STRIDE, PAD, 64)
+    else:
+        compiled = cute.compile(static_entry, act_cute, weight_cute, out_cute, STRIDE, PAD, 128)
     act_nchw = activations.permute(0, 3, 1, 2).contiguous()
     weight_nchw = weight.permute(0, 3, 1, 2).contiguous()
     def run_ref():

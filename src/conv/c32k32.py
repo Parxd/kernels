@@ -196,7 +196,8 @@ def static_entry(
     filter: cute.Tensor,
     out: cute.Tensor,
     stride: cutlass.Constexpr,
-    pad: cutlass.Constexpr
+    pad: cutlass.Constexpr,
+    tile_m: cutlass.Constexpr
 ):
     batch_size, height, width, in_channels = activations.shape
     out_channels, filter_height, filter_width, _ = filter.shape
@@ -204,7 +205,12 @@ def static_entry(
 
     # ------ Tiler Config ------
     TILE_P = 8
-    TILE_Q = 16
+    if cutlass.const_expr(tile_m == 64):
+        TILE_Q = 8
+    elif cutlass.const_expr(tile_m == 128):
+        TILE_Q = 16
+    else:
+        raise Exception("Tiler for M-mode must be one of: [64, 128]")
     tiler_m = (1, TILE_P, TILE_Q)
     tiler_n = 32
     tiler_k = (1, 1, 32)
@@ -337,10 +343,11 @@ def dynamic_entry(
     P: cutlass.Int32,
     Q: cutlass.Int32,
     stride: cutlass.Int32,
-    pad: cutlass.Int32
+    pad: cutlass.Int32,
+    tile_m: cutlass.Int32
 ):
     C = cute.assume(C, divby=8)
     activations = cute.make_tensor(activations_ptr, cute.make_ordered_layout((N, H, W, C), order=(3, 2, 1, 0)))
     filter = cute.make_tensor(filter_ptr, cute.make_ordered_layout((K, R, S, C), order=(3, 2, 1, 0)))
     out = cute.make_tensor(out_ptr, cute.make_ordered_layout((N, P, Q, K), order=(3, 2, 1, 0)))
-    static_entry(activations, filter, out, stride, pad)
+    static_entry(activations, filter, out, stride, pad, tile_m)
