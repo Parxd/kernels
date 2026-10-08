@@ -117,13 +117,17 @@ def kernel(
     tOrV_copy = tsV.retile(tOrV)
 
     rowmax = cute.make_rmem_tensor(
-        (2, cute.size(tPsP, [1])), dtype=cute.Float32
-    )  # (prev, current)
+        (2, cute.size(cute.get(tPrP.layout, [0, 1])), cute.size(tPrP, [1])),
+        dtype=cute.Float32,
+    )  # ((prev, current), accum. fragment rows, warp rows)
     denom = cute.make_rmem_tensor(
-        (2, cute.size(tPsP, [1])), dtype=cute.Float32
-    )  # (prev, current)
+        (2, cute.size(cute.get(tPrP.layout, [0, 1])), cute.size(tPrP, [1])),
+        dtype=cute.Float32,
+    )  # ((prev, current), accum. fragment rows, warp rows)
     rowmax.fill(-cute.Float.inf)
     denom.fill(0.0)
+    print(rowmax)
+    print(denom)
 
     cute.copy(tiled_copy_Q, tQgQ[None, None, 0, 0], tQsQ[None, None, 0])
     kv_iters_full = bidz * (BLOCK_Q // BLOCK_K)  # BLOCK_K must divide BLOCK_Q
