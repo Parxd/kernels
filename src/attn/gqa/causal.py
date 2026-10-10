@@ -12,6 +12,7 @@ S = 1024  # seq. len.
 H_D = 128  # head dim.
 M_D = 8192  # model dim.
 BLOCK_Q, BLOCK_K = 128, 64  # query, key tiles
+LOG2_E = 1.44269504089
 dtype, cute_dtype = torch.bfloat16, cute.BFloat16
 torch.manual_seed(0)
 
@@ -67,14 +68,16 @@ def kernel(
             cute.struct.MemRange[cute_dtype, cute.cosize(sKV_layout)], 16
         ]
 
-    smem_alloc = cutlass.utils.SmemAllocator()
+    smem_alloc = cutlass.memory.SmemAllocator()
     smem = smem_alloc.allocate(SharedStorageQKV.size_in_bytes(), byte_alignment=16)
     sQ = SharedStorageQKV(smem).q.get_tensor(sQ_layout)
     sK = SharedStorageQKV(smem).k.get_tensor(sKV_layout)
     sV = SharedStorageQKV(smem).v.get_tensor(sKV_layout)
+    sVt = cute.composition(sV, cute.make_layout((H_D, BLOCK_K), stride=(BLOCK_K, 1)))
     print(f"\tsQ: {sQ}")
     print(f"\tsK: {sK}")
-    print(f"\tsV: {sV}\n")
+    print(f"\tsV: {sV}")
+    print(f"\tsVt: {sVt}\n")
 
     # g2s copy slices
     tQ = tiled_copy_Q.get_slice(tidx)
@@ -89,45 +92,51 @@ def kernel(
     thr_mma = tiled_mma.get_slice(tidx)
     tPsQ = thr_mma.partition_A(sQ)
     tPsK = thr_mma.partition_B(sK)
-    tPsP = thr_mma.partition_shape_C(
-        (BLOCK_Q, BLOCK_K)
-    )  # get P fragment shape w/o physical sP tensor
-    tOsV = thr_mma.partition_B(sV)
+    tPsP = thr_mma.partition_shape_C((BLOCK_Q, BLOCK_K))
+    tOsO = thr_mma.partition_shape_C((BLOCK_Q, H_D))
+    tOsV = thr_mma.partition_B(sVt)
     tPrQ = thr_mma.make_fragment_A(tPsQ)
     tPrK = thr_mma.make_fragment_B(tPsK)
     tPrP = thr_mma.make_fragment_C(tPsP)
     tOrV = thr_mma.make_fragment_B(tOsV)
+    tOrO = thr_mma.make_fragment_C(tOsO)
+    tOrO.fill(0.0)
     # s2r copy slices
-    s2r_copy_atom = cute.make_copy_atom(
-        cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4), cute_dtype
+    s2r_copy_atom_QK = cute.make_copy_atom(
+        cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), cute_dtype
     )
-    s2r_tiled_copy_Q = cute.make_tiled_copy_A(s2r_copy_atom, tiled_mma)
-    s2r_tiled_copy_K = s2r_tiled_copy_V = cute.make_tiled_copy_B(
-        s2r_copy_atom, tiled_mma
+    s2r_copy_atom_V = cute.make_copy_atom(
+        cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), cute_dtype
     )
+    s2r_tiled_copy_Q = cute.make_tiled_copy_A(s2r_copy_atom_QK, tiled_mma)
+    s2r_tiled_copy_K = cute.make_tiled_copy_B(s2r_copy_atom_QK, tiled_mma)
+    s2r_tiled_copy_V = cute.make_tiled_copy_B(s2r_copy_atom_V, tiled_mma)
 
     tsQ = s2r_tiled_copy_Q.get_slice(tidx)
     tsK = s2r_tiled_copy_K.get_slice(tidx)
     tsV = s2r_tiled_copy_V.get_slice(tidx)
     tPsQ_copy = tsQ.partition_S(sQ)
     tPsK_copy = tsK.partition_S(sK)
-    tOsV_copy = tsV.partition_S(sV)
+    tOsV_copy = tsV.partition_S(sVt)
     tPrQ_copy = tsQ.retile(tPrQ)
     tPrK_copy = tsK.retile(tPrK)
     tOrV_copy = tsV.retile(tOrV)
 
-    rowmax = cute.make_rmem_tensor(
-        (2, cute.size(cute.get(tPrP.layout, [0, 1])), cute.size(tPrP, [1])),
+    row_max = cute.make_rmem_tensor(
+        (cute.size(tPrP, mode=[0, 1]), cute.size(tPrP, mode=[1])),
         dtype=cute.Float32,
-    )  # ((prev, current), accum. fragment rows, warp rows)
+    )  # current KV-tile row maxes
+    row_max_prev = cute.make_rmem_tensor(
+        (cute.size(tPrP, mode=[0, 1]), cute.size(tPrP, mode=[1])),
+        dtype=cute.Float32,
+    )  # previous KV-tile row maxes
     denom = cute.make_rmem_tensor(
-        (2, cute.size(cute.get(tPrP.layout, [0, 1])), cute.size(tPrP, [1])),
+        (cute.size(tPrP, mode=[0, 1]), cute.size(tPrP, mode=[1])),
         dtype=cute.Float32,
-    )  # ((prev, current), accum. fragment rows, warp rows)
-    rowmax.fill(-cute.Float.inf)
+    )
+    log2_softmax_scale = cute.Float32(LOG2_E * cute.math.rsqrt(cute.Float32(H_D)))
+    row_max.fill(-cute.Float.inf)
     denom.fill(0.0)
-    print(rowmax)
-    print(denom)
 
     cute.copy(tiled_copy_Q, tQgQ[None, None, 0, 0], tQsQ[None, None, 0])
     kv_iters_full = bidz * (BLOCK_Q // BLOCK_K)  # BLOCK_K must divide BLOCK_Q
@@ -135,20 +144,22 @@ def kernel(
     for j in range(kv_iters_full):
         tPrP.fill(0.0)
         cute.copy(tiled_copy_KV, tKgK[None, None, 0, j, 0], tKsK[None, None, 0])
+        cute.arch.cp_async_commit_group()
         cute.copy(tiled_copy_KV, tVgV[None, None, 0, j, 0], tVsV[None, None, 0])
         cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(0)
+        cute.arch.cp_async_wait_group(1)
         cute.arch.sync_threads()
-        for k_block in range(H_D // 16):  # tensor core inst. uses K=16
+        for k_block in cutlass.range_constexpr(H_D // 16):
+            # TODO: could move this to outside KV-loop
             cute.copy(
                 s2r_tiled_copy_Q,
-                tPsQ_copy[(None, (None, k_block)), 0, 0],
-                tPrQ_copy[(None, (None, k_block)), 0, 0],
+                tPsQ_copy[None, None, k_block],
+                tPrQ_copy[None, None, k_block],
             )
             cute.copy(
                 s2r_tiled_copy_K,
-                tPsK_copy[(None, (None, k_block)), 0, 0],
-                tPrK_copy[(None, (None, k_block)), 0, 0],
+                tPsK_copy[None, None, k_block],
+                tPrK_copy[None, None, k_block],
             )
             cute.gemm(
                 tiled_mma,
@@ -157,10 +168,79 @@ def kernel(
                 tPrK[None, None, k_block],
                 tPrP,
             )
+        # TODO: refactor to be more "CuTe-idiomatic"?
+        row_max_prev.store(row_max.load())
+        for mma_m in cutlass.range_constexpr(cute.size(row_max, mode=[1])):  # MMA_M
+            for frg_m in cutlass.range_constexpr(cute.size(row_max, mode=[0])):  # FRG_M
+                thr_row = tPrP[(None, frg_m), mma_m, None]
+                thr_max = thr_row.load().reduce(
+                    cute.ReductionOp.MAX,
+                    row_max_prev[frg_m, mma_m],
+                    reduction_profile=0,
+                )
+                row_max[frg_m, mma_m] = cute.arch.warp_reduction(
+                    thr_max, cute.math.max, threads_in_group=4
+                )
+                thr_row.store(
+                    cute.math.exp2(
+                        thr_row.load() * log2_softmax_scale
+                        - row_max[frg_m, mma_m] * log2_softmax_scale
+                    )
+                )
+                denom_norm = cute.math.exp2(
+                    (row_max_prev[frg_m, mma_m] - row_max[frg_m, mma_m])
+                    * log2_softmax_scale
+                )
+                thr_sum = thr_row.load().reduce(
+                    cute.ReductionOp.ADD,
+                    0.0,
+                    reduction_profile=0,
+                )
+                denom[frg_m, mma_m] = (
+                    denom_norm * denom[frg_m, mma_m] + thr_sum
+                )  # defer warp-level sum
+
+                o_row = tOrO[(None, frg_m), mma_m, None]
+                o_row.store(o_row.load() * denom_norm)
+        tPrP_bf16 = cute.make_rmem_tensor_like(tPrP, dtype=cute.BFloat16)
+        tPrP_bf16.store(tPrP.load().to(cute.BFloat16))
+        tPrP_lt = cute.logical_divide(tPrP.layout, (None, None, 2))
+        tOrP = cute.make_tensor(
+            tPrP_bf16.iterator,
+            cute.make_layout(
+                shape=(
+                    (tPrP_lt.shape[0], tPrP_lt.shape[2][0]),
+                    tPrP_lt.shape[1],
+                    tPrP_lt.shape[2][1],
+                ),
+                stride=(
+                    (tPrP_lt.stride[0], tPrP_lt.stride[2][0]),
+                    tPrP_lt.stride[1],
+                    tPrP_lt.stride[2][1],
+                ),
+            ),
+        )
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+        for k_block in cutlass.range_constexpr(BLOCK_K // 16):
+            cute.copy(
+                s2r_tiled_copy_V,
+                tOsV_copy[None, None, k_block],
+                tOrV_copy[None, None, k_block],
+            )
+            cute.gemm(
+                tiled_mma,
+                tOrO,
+                tOrP[None, None, k_block],
+                tOrV[None, None, k_block],
+                tOrO,
+            )
+        cute.arch.sync_threads()
 
 
 @cute.jit
 def call(q: cute.Tensor, k: cute.Tensor, v: cute.Tensor, o: cute.Tensor):
+    mma_inst = (16, 8, 16)
     q_tile = (BLOCK_Q, H_D)
     k_tile = v_tile = (BLOCK_K, H_D)
     mma_tile = (4, 1, 1)
@@ -184,16 +264,25 @@ def call(q: cute.Tensor, k: cute.Tensor, v: cute.Tensor, o: cute.Tensor):
         swizzle, 0, outer=cute.make_ordered_layout((BLOCK_K, H_D), order=(1, 0))
     )
     mma_op = cute.nvgpu.warp.MmaF16BF16Op(
-        cute_dtype, cute.Float32, (16, 8, 16)
+        cute_dtype, cute.Float32, mma_inst
     )  # QK^T accumulated to fp32, then cast back to bf16 for PV
     tiled_mma = cute.make_tiled_mma(
-        mma_op, mma_tile, permutation_mnk=(BLOCK_Q, BLOCK_K, H_D)
-    )  # TODO: add permutation on N-mode?
+        mma_op,
+        mma_tile,
+        permutation_mnk=(
+            mma_inst[0] * cute.size(mma_tile),
+            mma_inst[1] * 2,
+            mma_inst[2],
+        ),
+    )
     grid_dims = (B, H_Q, cute.ceil_div(S, BLOCK_Q))
     block_dims = (cute.size(mma_tile) * 32, 1, 1)
     kernel(q, k, v, o, sQ, sKV, g2s_tiled_copy, g2s_tiled_copy, tiled_mma).launch(
         grid=grid_dims, block=block_dims
     )
+
+
+def torch_naive(q, k, v, o): ...
 
 
 def main():
