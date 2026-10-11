@@ -1,4 +1,4 @@
-from math import log2
+from math import log2, sqrt
 import torch
 import cutlass
 import cutlass.cute as cute
@@ -32,7 +32,8 @@ def kernel(
     cta_tiler = (BLOCK_Q, BLOCK_K, H_D)
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, bidz = cute.arch.block_idx()
-    b_coord = (bidz, None, None)  # CTAs own all kv-tiles
+    # CTAs own all kv-tiles
+    b_coord = (bidz, None, 0)  # 0 in last mode since H_D == cta_tiler[2]
 
     gQ = cute.local_tile(
         mQ[bidx, None, bidy, None],
@@ -52,9 +53,16 @@ def kernel(
         coord=b_coord,
         proj=(None, 1, 1),
     )
+    gO = cute.local_tile(
+        mO[bidx, None, bidy, None],
+        tiler=cta_tiler,
+        coord=b_coord,
+        proj=(1, None, 1),
+    )
     print(f"\tgQ: {gQ}")
     print(f"\tgK: {gK}")
-    print(f"\tgV: {gV}\n")
+    print(f"\tgV: {gV}")
+    print(f"\tgO: {gO}\n")
 
     @cute.struct
     class SharedStorageQKV:
@@ -88,18 +96,18 @@ def kernel(
     tQsQ = tQ.partition_D(sQ)
     tKsK = tK.partition_D(sK)
     tVsV = tV.partition_D(sV)
-    # MMA slices (P := QK^T)
+    # MMA slices (P := QK^T, O := PV)
     thr_mma = tiled_mma.get_slice(tidx)
     tPsQ = thr_mma.partition_A(sQ)
     tPsK = thr_mma.partition_B(sK)
     tPsP = thr_mma.partition_shape_C((BLOCK_Q, BLOCK_K))
-    tOsO = thr_mma.partition_shape_C((BLOCK_Q, H_D))
+    tOgO = thr_mma.partition_C(gO)
     tOsV = thr_mma.partition_B(sVt)
     tPrQ = thr_mma.make_fragment_A(tPsQ)
     tPrK = thr_mma.make_fragment_B(tPsK)
     tPrP = thr_mma.make_fragment_C(tPsP)
     tOrV = thr_mma.make_fragment_B(tOsV)
-    tOrO = thr_mma.make_fragment_C(tOsO)
+    tOrO = thr_mma.make_fragment_C(tOgO)
     tOrO.fill(0.0)
     # s2r copy slices
     s2r_copy_atom_QK = cute.make_copy_atom(
@@ -138,19 +146,20 @@ def kernel(
     row_max.fill(-cute.Float.inf)
     denom.fill(0.0)
 
-    cute.copy(tiled_copy_Q, tQgQ[None, None, 0, 0], tQsQ[None, None, 0])
+    cute.copy(tiled_copy_Q, tQgQ[None, None, 0], tQsQ[None, None, 0])
     kv_iters_full = bidz * (BLOCK_Q // BLOCK_K)  # BLOCK_K must divide BLOCK_Q
     kv_iters_masked = (bidz + 1) * (BLOCK_Q // BLOCK_K)
-    for j in range(kv_iters_full):
+    kv_iters_test = S // BLOCK_K  # TODO: testing
+    for j in range(kv_iters_test):
         tPrP.fill(0.0)
-        cute.copy(tiled_copy_KV, tKgK[None, None, 0, j, 0], tKsK[None, None, 0])
+        cute.copy(tiled_copy_KV, tKgK[None, None, 0, j], tKsK[None, None, 0])
         cute.arch.cp_async_commit_group()
-        cute.copy(tiled_copy_KV, tVgV[None, None, 0, j, 0], tVsV[None, None, 0])
+        cute.copy(tiled_copy_KV, tVgV[None, None, 0, j], tVsV[None, None, 0])
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(1)
         cute.arch.sync_threads()
         for k_block in cutlass.range_constexpr(H_D // 16):
-            # TODO: could move this to outside KV-loop
+            # TODO: could move this outside KV-loop
             cute.copy(
                 s2r_tiled_copy_Q,
                 tPsQ_copy[None, None, k_block],
@@ -168,10 +177,9 @@ def kernel(
                 tPrK[None, None, k_block],
                 tPrP,
             )
-        # TODO: refactor to be more "CuTe-idiomatic"?
         row_max_prev.store(row_max.load())
         for mma_m in cutlass.range_constexpr(cute.size(row_max, mode=[1])):  # MMA_M
-            for frg_m in cutlass.range_constexpr(cute.size(row_max, mode=[0])):  # FRG_M
+            for frg_m in cutlass.range_constexpr(cute.size(row_max, mode=[0])):  # Frg_M
                 thr_row = tPrP[(None, frg_m), mma_m, None]
                 thr_max = thr_row.load().reduce(
                     cute.ReductionOp.MAX,
@@ -236,13 +244,26 @@ def kernel(
                 tOrO,
             )
         cute.arch.sync_threads()
+    for mma_m in cutlass.range_constexpr(cute.size(tOgO, mode=[1])):
+        for frg_m in cutlass.range_constexpr(cute.size(tOgO, mode=[0, 1])):
+            denom_final = cute.arch.warp_reduction(
+                denom[frg_m, mma_m], cute.math.add, threads_in_group=4
+            )
+            thr_row = tOrO[(None, frg_m), mma_m, None]
+            thr_row.store(thr_row.load() * cute.math.rcp(denom_final))
+    tOrO_bf16 = cute.make_rmem_tensor_like(tOrO, dtype=cute.BFloat16)
+    tOrO_bf16.store(tOrO.load().to(cute.BFloat16))
+    r2g_copy_atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(),
+        cute.BFloat16,
+        num_bits_per_copy=(2 * cute.BFloat16.width),
+    )
+    cute.copy(r2g_copy_atom, tOrO_bf16, tOgO)
 
 
 @cute.jit
 def call(q: cute.Tensor, k: cute.Tensor, v: cute.Tensor, o: cute.Tensor):
     mma_inst = (16, 8, 16)
-    q_tile = (BLOCK_Q, H_D)
-    k_tile = v_tile = (BLOCK_K, H_D)
     mma_tile = (4, 1, 1)
     g2s_copy_atom = cute.make_copy_atom(
         cute.nvgpu.cpasync.CopyG2SOp(), cute_dtype, num_bits_per_copy=128
@@ -282,7 +303,26 @@ def call(q: cute.Tensor, k: cute.Tensor, v: cute.Tensor, o: cute.Tensor):
     )
 
 
-def torch_naive(q, k, v, o): ...
+def torch_naive_noncausal(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_limit=0
+) -> torch.Tensor:
+    if kv_limit:
+        k = k[:, 0:kv_limit, :, :]
+        v = v[:, 0:kv_limit, :, :]
+    q_perm = q.permute(0, 2, 1, 3)
+    k_perm = k.permute(0, 2, 1, 3).repeat_interleave(GROUPS, 1)
+    v_perm = v.permute(0, 2, 1, 3).repeat_interleave(GROUPS, 1)
+    s = torch.matmul(q_perm, k_perm.transpose(2, 3)) / sqrt(
+        H_D
+    )  # (B, q heads, S, kv_limit)
+    p = torch.softmax(s, dim=3)
+    out = torch.matmul(p, v_perm)  # (B, q heads, S, head_dim)
+    return out.permute(0, 2, 1, 3).to(dtype=dtype)
+
+
+def torch_naive_causal(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor: ...
 
 
 def main():
@@ -290,13 +330,25 @@ def main():
     k = torch.randn(B, S, H_KV, H_D, dtype=dtype, device="cuda")
     v = torch.randn(B, S, H_KV, H_D, dtype=dtype, device="cuda")
     o = torch.empty(B, S, H_Q, H_D, dtype=dtype, device="cuda")
-    call(
+    compiled = cute.compile(
+        call,
+        from_dlpack(q, assumed_align=16),
+        from_dlpack(k, assumed_align=16),
+        from_dlpack(v, assumed_align=16),
+        from_dlpack(o, assumed_align=16),
+        options="remarks{ptx}",
+    )
+    compiled(
         from_dlpack(q, assumed_align=16),
         from_dlpack(k, assumed_align=16),
         from_dlpack(v, assumed_align=16),
         from_dlpack(o, assumed_align=16),
     )
     torch.cuda.synchronize()
+
+    o_torch = torch_naive_noncausal(q, k, v)
+
+    torch.testing.assert_close(o.float(), o_torch.float(), atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":
