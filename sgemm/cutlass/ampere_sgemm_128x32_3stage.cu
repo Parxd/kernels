@@ -72,10 +72,9 @@ __global__ void ampere_sgemm_128x32_3stage(
     if(thread0()) {
         // print(copy_A.tidfrg_D(sA)); print("\n");
         // print(copy_B.tidfrg_S(sB)); print("\n");
-        // print(tiled_mma.thrfrg_A(sA)); print("\n");
+        print(tiled_mma.thrfrg_A(sA)); print("\n");
         // print(tiled_mma.thrfrg_B(sB)); print("\n");
         // print(tiled_mma.thrfrg_C(gC)); print("\n");
-        print(tCsA(_,_,_,0));
     }
 #endif
 
@@ -128,9 +127,9 @@ __global__ void ampere_sgemm_128x32_3stage(
     auto tCgC_fragment = make_fragment_like(tCrC(_,_,0));  // (1,8) : (0,1)
     // in hopes of TLP
     for (uint col = 0; col < size<2>(tCgC); ++col) {
-        copy(tCgC(_,_,col), tCgC_fragment);
+        copy(AutoVectorizingCopy{}, tCgC(_,_,col), tCgC_fragment);
         axpby(alpha, tCrC(_,_,col), beta, tCgC_fragment);
-        copy(tCgC_fragment, tCgC(_,_,col));
+        copy(AutoVectorizingCopy{}, tCgC_fragment, tCgC(_,_,col));
     }
 #endif
 

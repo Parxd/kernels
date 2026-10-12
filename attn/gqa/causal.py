@@ -59,10 +59,6 @@ def kernel(
         coord=b_coord,
         proj=(1, None, 1),
     )
-    print(f"\tgQ: {gQ}")
-    print(f"\tgK: {gK}")
-    print(f"\tgV: {gV}")
-    print(f"\tgO: {gO}\n")
 
     @cute.struct
     class SharedStorageQKV:
@@ -82,6 +78,11 @@ def kernel(
     sK = SharedStorageQKV(smem).k.get_tensor(sKV_layout)
     sV = SharedStorageQKV(smem).v.get_tensor(sKV_layout)
     sVt = cute.composition(sV, cute.make_layout((H_D, BLOCK_K), stride=(BLOCK_K, 1)))
+
+    print(f"\tgQ: {gQ}")
+    print(f"\tgK: {gK}")
+    print(f"\tgV: {gV}")
+    print(f"\tgO: {gO}\n")
     print(f"\tsQ: {sQ}")
     print(f"\tsK: {sK}")
     print(f"\tsV: {sV}")
@@ -101,6 +102,8 @@ def kernel(
     tPsQ = thr_mma.partition_A(sQ)
     tPsK = thr_mma.partition_B(sK)
     tPsP = thr_mma.partition_shape_C((BLOCK_Q, BLOCK_K))
+    cP = cute.make_identity_tensor((BLOCK_Q, BLOCK_K))
+    tPcP = thr_mma.partition_C(cP)
     tOgO = thr_mma.partition_C(gO)
     tOsV = thr_mma.partition_B(sVt)
     tPrQ = thr_mma.make_fragment_A(tPsQ)
@@ -149,8 +152,7 @@ def kernel(
     cute.copy(tiled_copy_Q, tQgQ[None, None, 0], tQsQ[None, None, 0])
     kv_iters_full = bidz * (BLOCK_Q // BLOCK_K)  # BLOCK_K must divide BLOCK_Q
     kv_iters_masked = (bidz + 1) * (BLOCK_Q // BLOCK_K)
-    kv_iters_test = S // BLOCK_K  # TODO: testing
-    for j in range(kv_iters_test):
+    for j in range(kv_iters_masked):
         tPrP.fill(0.0)
         cute.copy(tiled_copy_KV, tKgK[None, None, 0, j], tKsK[None, None, 0])
         cute.arch.cp_async_commit_group()
@@ -177,6 +179,11 @@ def kernel(
                 tPrK[None, None, k_block],
                 tPrP,
             )
+        if j >= kv_iters_full:
+            for i in cutlass.range_constexpr(cute.size(tPrP)):
+                x, y = tPcP[i][0], tPcP[i][1]
+                if y + (j * BLOCK_K) > x + (bidz * BLOCK_Q):
+                    tPrP[i] = -cute.Float32.inf
         row_max_prev.store(row_max.load())
         for mma_m in cutlass.range_constexpr(cute.size(row_max, mode=[1])):  # MMA_M
             for frg_m in cutlass.range_constexpr(cute.size(row_max, mode=[0])):  # Frg_M
@@ -254,7 +261,7 @@ def kernel(
     tOrO_bf16 = cute.make_rmem_tensor_like(tOrO, dtype=cute.BFloat16)
     tOrO_bf16.store(tOrO.load().to(cute.BFloat16))
     r2g_copy_atom = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(),
+        cute.nvgpu.CopyR2GOp(),
         cute.BFloat16,
         num_bits_per_copy=(2 * cute.BFloat16.width),
     )
@@ -303,8 +310,12 @@ def call(q: cute.Tensor, k: cute.Tensor, v: cute.Tensor, o: cute.Tensor):
     )
 
 
-def torch_naive_noncausal(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_limit=0
+def torch_naive(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool = False,
+    kv_limit: int = 0,
 ) -> torch.Tensor:
     if kv_limit:
         k = k[:, 0:kv_limit, :, :]
@@ -312,17 +323,15 @@ def torch_naive_noncausal(
     q_perm = q.permute(0, 2, 1, 3)
     k_perm = k.permute(0, 2, 1, 3).repeat_interleave(GROUPS, 1)
     v_perm = v.permute(0, 2, 1, 3).repeat_interleave(GROUPS, 1)
-    s = torch.matmul(q_perm, k_perm.transpose(2, 3)) / sqrt(
-        H_D
-    )  # (B, q heads, S, kv_limit)
+    s = torch.matmul(q_perm, k_perm.transpose(2, 3)) / sqrt(H_D)
+    if causal:
+        s = s.masked_fill(
+            torch.ones((S, S), dtype=torch.bool).to('cuda').triu(1),
+            -torch.inf,
+        )
     p = torch.softmax(s, dim=3)
-    out = torch.matmul(p, v_perm)  # (B, q heads, S, head_dim)
+    out = torch.matmul(p, v_perm)
     return out.permute(0, 2, 1, 3).to(dtype=dtype)
-
-
-def torch_naive_causal(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
-) -> torch.Tensor: ...
 
 
 def main():
@@ -336,7 +345,7 @@ def main():
         from_dlpack(k, assumed_align=16),
         from_dlpack(v, assumed_align=16),
         from_dlpack(o, assumed_align=16),
-        options="remarks{ptx}",
+        # options="remarks{ptx}",
     )
     compiled(
         from_dlpack(q, assumed_align=16),
@@ -346,8 +355,7 @@ def main():
     )
     torch.cuda.synchronize()
 
-    o_torch = torch_naive_noncausal(q, k, v)
-
+    o_torch = torch_naive(q, k, v, causal=True)
     torch.testing.assert_close(o.float(), o_torch.float(), atol=2e-2, rtol=2e-2)
 
 

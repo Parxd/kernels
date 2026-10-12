@@ -47,40 +47,40 @@ def common_shapes():
         ("resnet_stage3", 8, 14, 14, 256, 256),
         ("resnet_stage4", 8, 7,  7,  512, 512),
     ]
-    for name, N, H, W, C, K in resnet_3x3:
-        shapes.append(ConvShape(name, N, H, W, C, K, 3, 3, STRIDE=1, PAD=1))
+    # for name, N, H, W, C, K in resnet_3x3:
+    #     shapes.append(ConvShape(name, N, H, W, C, K, 3, 3, STRIDE=1, PAD=1))
 
     downsample_3x3 = [
         ("downsample_1", 8, 112, 112, 64, 128),
         ("downsample_2", 8, 56,  56,  128, 256),
         ("downsample_3", 8, 28,  28,  256, 512),
     ]
-    for name, N, H, W, C, K in downsample_3x3:
-        shapes.append(ConvShape(name, N, H, W, C, K, 3, 3, STRIDE=2, PAD=1))
+    # for name, N, H, W, C, K in downsample_3x3:
+    #     shapes.append(ConvShape(name, N, H, W, C, K, 3, 3, STRIDE=2, PAD=1))
 
     pointwise = [
         ("pointwise_1", 8, 56, 56, 64, 256),
         ("pointwise_2", 8, 28, 28, 128, 512),
         ("pointwise_3", 8, 14, 14, 256, 1024),
     ]
-    for name, N, H, W, C, K in pointwise:
-        shapes.append(ConvShape(name, N, H, W, C, K, 1, 1, STRIDE=1, PAD=0))
+    # for name, N, H, W, C, K in pointwise:
+    #     shapes.append(ConvShape(name, N, H, W, C, K, 1, 1, STRIDE=1, PAD=0))
 
-    shapes.append(ConvShape("inception_5x5", 8, 28, 28, 192, 32, 5, 5, STRIDE=1, PAD=2))
+    # shapes.append(ConvShape("inception_5x5", 8, 28, 28, 192, 32, 5, 5, STRIDE=1, PAD=2))
 
-    shapes.append(ConvShape("yolo_head", 8, 80, 80, 256, 256, 3, 3, 1, 1))
-    shapes.append(ConvShape("yolo_neck", 8, 40, 40, 512, 256, 1, 1, 1, 0))
-    shapes.append(ConvShape("yolov11_layer2", 8, 320, 320, 32, 64, 3, 3, 2, 1))
-    shapes.append(ConvShape("yolov11_layer3", 8, 160, 160, 64, 64, 3, 3, 1, 0))
+    # shapes.append(ConvShape("yolo_head", 8, 80, 80, 256, 256, 3, 3, 1, 1))
+    # shapes.append(ConvShape("yolo_neck", 8, 40, 40, 512, 256, 1, 1, 1, 0))
+    # shapes.append(ConvShape("yolov11_layer2", 8, 320, 320, 32, 64, 3, 3, 2, 1))
+    # shapes.append(ConvShape("yolov11_layer3", 8, 160, 160, 64, 64, 3, 3, 1, 0))
 
-    shapes.append(ConvShape("vgg_early", 8, 224, 224, 64, 64, 3, 3, 1, 1))
-    shapes.append(ConvShape("vgg_mid", 8, 112, 112, 128, 128, 3, 3, 1, 1))
+    # shapes.append(ConvShape("vgg_early", 8, 224, 224, 64, 64, 3, 3, 1, 1))
+    # shapes.append(ConvShape("vgg_mid", 8, 112, 112, 128, 128, 3, 3, 1, 1))
 
     shapes.append(ConvShape("unet_enc", 8, 128, 128, 64, 128, 3, 3, 1, 1))
     shapes.append(ConvShape("unet_dec", 8, 128, 128, 128, 64, 3, 3, 1, 1))
 
-    shapes.append(ConvShape("m-test1", 1, 30, 30, 128, 64, 3, 3, 1, 1))
-    shapes.append(ConvShape("m-test2", 2, 40, 40, 128, 64, 3, 3, 1, 1))
+    # shapes.append(ConvShape("m-test1", 1, 30, 30, 128, 64, 3, 3, 1, 1))
+    # shapes.append(ConvShape("m-test2", 2, 40, 40, 128, 64, 3, 3, 1, 1))
 
     return shapes
 

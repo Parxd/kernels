@@ -6,8 +6,15 @@
 #include <thrust/device_vector.h>
 #include "../utils.h"
 
+#include "cute/arch/mma_sm80.hpp"
 #include "cutlass/smem.cu"
 #include "cutlass/smem_swizzle.cu"
+
+#include <cute/tensor.hpp>
+
+namespace test {
+
+}
 
 namespace transpose {
     void run_kernel(int kernel, int m, int n, float* src, float* dst) {
@@ -104,6 +111,18 @@ int main(int argc, char* argv[]) {
         if (failed) return 1;
         else std::cout << "[Transpose]: All elements match for delta=" << delta << "\n";
     }
+
+    using namespace cute;
+    auto tiled = make_tiled_mma(
+        SM80_16x8x16_F16F16F16F16_TN{},
+        Layout<Shape<_4, _1, _1>>{},
+        Tile<
+            _64,
+            _32,
+            _16
+        >{}
+    );
+    print_latex(tiled);
 
     return 0;
 }

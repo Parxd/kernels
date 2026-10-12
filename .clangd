@@ -1,5 +1,7 @@
 CompileFlags:
+  Remove: [-arch=*, --options-file, --ptxas-options=*, -Xcompiler=*, -rdc=*]
+  # CompilationDatabase: build/
   Add:
-    - -I/home/parxed/code/cuda-optim/cutlass/include/
-    - -I/home/parxed/code/cuda-optim/cutlass/tools/util/include/
-    - -I/home/parxed/code/cuda-optim/cutlass/examples/common/
+    - -I/home/parxed/code/kernels/cutlass-repo/include/
+    - -I/home/parxed/code/kernels/cutlass-repo/tools/util/include/
+    - -I/home/parxed/code/kernels/cutlass-repo/examples/common/
