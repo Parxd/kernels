@@ -11,7 +11,7 @@ GROUPS = H_Q // H_KV
 S = 1024  # seq. len.
 H_D = 128  # head dim.
 M_D = 8192  # model dim.
-BLOCK_Q, BLOCK_K = 128, 64  # query, key tiles
+BLOCK_Q, BLOCK_K = 64, 64  # query, key tiles
 LOG2_E = 1.44269504089
 dtype, cute_dtype = torch.bfloat16, cute.BFloat16
 torch.manual_seed(0)
@@ -155,10 +155,9 @@ def kernel(
     for j in range(kv_iters_masked):
         tPrP.fill(0.0)
         cute.copy(tiled_copy_KV, tKgK[None, None, 0, j], tKsK[None, None, 0])
-        cute.arch.cp_async_commit_group()
         cute.copy(tiled_copy_KV, tVgV[None, None, 0, j], tVsV[None, None, 0])
         cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(1)
+        cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
         for k_block in cutlass.range_constexpr(H_D // 16):
             # TODO: could move this outside KV-loop
@@ -235,8 +234,6 @@ def kernel(
                 ),
             ),
         )
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
         for k_block in cutlass.range_constexpr(BLOCK_K // 16):
             cute.copy(
                 s2r_tiled_copy_V,
@@ -280,11 +277,7 @@ def call(q: cute.Tensor, k: cute.Tensor, v: cute.Tensor, o: cute.Tensor):
         cute.make_ordered_layout((8, 16), (1, 0)),
         cute.make_ordered_layout((1, 8), (1, 0)),
     )
-    # smem major-dim = 64x bf16 = 128B = all 32x 4B banks
-    swizzle_b = int(
-        log2(H_D * cute_dtype.width // 128)
-    )  # 128 contiguous bits in g2s copy and LdMatrix inst. per lane
-    swizzle = cute.make_swizzle(b=swizzle_b, m=3, s=3)
+    swizzle = cute.make_swizzle(b=3, m=3, s=4)
     sQ = cute.make_composed_layout(
         swizzle, 0, outer=cute.make_ordered_layout((BLOCK_Q, H_D), order=(1, 0))
     )
@@ -345,7 +338,7 @@ def main():
         from_dlpack(k, assumed_align=16),
         from_dlpack(v, assumed_align=16),
         from_dlpack(o, assumed_align=16),
-        # options="remarks{ptx}",
+        options="remarks{ptx}",
     )
     compiled(
         from_dlpack(q, assumed_align=16),
