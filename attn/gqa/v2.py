@@ -348,8 +348,17 @@ def main():
     )
     torch.cuda.synchronize()
 
-    o_torch = torch_naive(q, k, v, causal=True)
-    torch.testing.assert_close(o.float(), o_torch.float(), atol=2e-2, rtol=2e-2)
+    # o_torch_naive = torch_naive(q, k, v, causal=True)
+    # torch.testing.assert_close(o.float(), o_torch_naive.float(), atol=2e-2, rtol=2e-2)
+
+    o_sdpa = torch.nn.functional.scaled_dot_product_attention(
+        q.permute(0, 2, 1, 3),
+        k.permute(0, 2, 1, 3),
+        v.permute(0, 2, 1, 3),
+        is_causal=True,
+        enable_gqa=True,
+    ).permute(0, 2, 1, 3)    
+    torch.testing.assert_close(o.float(), o_sdpa.float(), atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":
